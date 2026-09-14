@@ -23,6 +23,16 @@
 #include "user_hid.h"
 #endif
 
+/* Guard B.2: upper bound (in 100 MHz ref-clock ticks) on how long the decouple side will
+ * block waiting for the AudioHub to complete a stream (re)configuration handshake. A lost or
+ * mis-ordered handshake (e.g. a command message truncated by a USB glitch) otherwise wedges
+ * the audio pipeline forever (needs a power-cycle). The normal handshake completes in well
+ * under a millisecond; the default is deliberately generous so it only ever fires on a genuine
+ * wedge. This is a recovery escape hatch, not a timing-critical value - tune on hardware. */
+#ifndef XUA_AUDIO_RENDEZVOUS_TIMEOUT_TICKS
+#define XUA_AUDIO_RENDEZVOUS_TIMEOUT_TICKS (10000000) /* 100 ms @ 100 MHz */
+#endif
+
 /* Volume and mute tables */
 #if (OUT_VOLUME_IN_MIXER == 0) && (OUTPUT_VOLUME_CONTROL == 1)
 unsigned int multOut[NUM_USB_CHAN_OUT + 1];
@@ -236,6 +246,31 @@ void handle_audio_request(chanend c_mix_out)
     }
     else
     {
+        /* Guard B.1: re-validate the read cursor against the ISR commit boundary on *every*
+         * frame. committed = (wrptr - rdptr), with ring wrap. Upstream drains the number of
+         * words named by the in-ring length prefix (aud_data_remaining_to_device) and never
+         * checks it against how much the USB ISR has actually committed - so a short/malformed
+         * OUT packet (or a falsified/over-reporting length prefix) lets the read cursor run
+         * past the commit boundary and emit stale, bit-misaligned ring bytes: ~1/4 s of
+         * full-scale noise, and worse, the cursor is left permanently desynced so playback
+         * never recovers without a power-cycle. Bound the drain to committed fill; on underrun
+         * emit a clean silent frame and re-prime instead. */
+        int committed = g_aud_from_host_wrptr - g_aud_from_host_rdptr;
+        if (committed < 0)
+        {
+            committed += BUFF_SIZE_OUT;
+        }
+
+        if (committed < (g_numUsbChan_Out * g_curSubSlot_Out))
+        {
+            for (int i = 0; i < NUM_USB_CHAN_OUT; i++)
+            {
+                outuint(c_mix_out, 0);
+            }
+            outUnderflow = 1;
+        }
+        else
+        {
         switch(g_curSubSlot_Out)
         {
 
@@ -345,6 +380,7 @@ __builtin_unreachable();
 
         /* 3/4 bytes per sample */
         aud_data_remaining_to_device -= (g_numUsbChan_Out * g_curSubSlot_Out);
+        } /* Guard B.1: end committed-fill re-validation */
     }
 
 #endif
@@ -616,7 +652,18 @@ __builtin_unreachable();
             g_aud_from_host_rdptr = aud_from_host_fifo_start;
         }
 
-        outUnderflow = (g_aud_from_host_rdptr == g_aud_from_host_wrptr);
+        /* Guard B.1: a strict "at least a length-prefix word is committed" test, not an
+         * exact-equality test. Once a falsified length prefix has stepped the read cursor
+         * *past* the write cursor, the two are never exactly equal again, so the original
+         * "==" test silently misses and the next "length" is read from stale ring bytes. */
+        {
+            int committed = g_aud_from_host_wrptr - g_aud_from_host_rdptr;
+            if (committed < 0)
+            {
+                committed += BUFF_SIZE_OUT;
+            }
+            outUnderflow = (committed < 4);
+        }
 
         if (!outUnderflow)
         {
@@ -682,7 +729,24 @@ static void check_and_signal_stream_event_to_audio(chanend c_mix_out, unsigned d
         {
             outct(c_mix_out, XUA_AUD_SET_AUDIO_STOP);
         }
-        chkct(c_mix_out, XS1_CT_END);
+        /* Guard B.2: time-bound the AudioHub rendezvous. The AudioHub must field the stream
+         * (re)configuration above and hand back XS1_CT_END. If that handshake is lost or
+         * mis-ordered (e.g. its command message was truncated by a USB glitch) a bare
+         * chkct() blocks forever and the whole audio pipeline wedges (needs a power-cycle).
+         * On timeout, abandon this handshake and let the outer control loop re-drive the
+         * (re)configuration rather than spinning. See XUA_AUDIO_RENDEZVOUS_TIMEOUT_TICKS. */
+        {
+            timer t_rendezvous;
+            unsigned rendezvous_start;
+            t_rendezvous :> rendezvous_start;
+            select
+            {
+                case chkct(c_mix_out, XS1_CT_END):
+                    break;
+                case t_rendezvous when timerafter(rendezvous_start + XUA_AUDIO_RENDEZVOUS_TIMEOUT_TICKS) :> void:
+                    break;
+            }
+        }
     }
     g_any_stream_active_old = g_any_stream_active_current;
 }
